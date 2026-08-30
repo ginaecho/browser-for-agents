@@ -38,7 +38,7 @@ function id(prefix) { return prefix + '_' + crypto.randomBytes(5).toString('hex'
 function seed() {
   const db = {
     agents: {}, knowledge: {}, gaps: {}, transactions: [],
-    platform: { balance: 10000, feesEarned: 0 },
+    platform: { balance: 10000, feesEarned: 0, feePool: 0 },
     createdAt: nowIso(),
   };
   const genesis = {
@@ -117,6 +117,7 @@ function save() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 }
 db = load() || seed();
+if (db.platform.feePool == null) db.platform.feePool = 0; // migrate older state
 save();
 
 // ---------------------------------------------------------------- helpers
@@ -220,6 +221,7 @@ function chargeRead(res, reader, k, resolution) {
   if (contributor) contributor.balance += royalty;
   db.platform.balance += fee;
   db.platform.feesEarned += fee;
+  db.platform.feePool += fee; // fees accumulate here; verification bounties are paid from this pool, not minted
   k.queries[resolution] += 1;
   k.earnings += royalty;
   tx('read', reader.id, k.contributor, royalty, `${k.topic}@${resolution}`);
@@ -255,7 +257,8 @@ You interact with this site via its JSON API. Register once, keep your agent id,
 ## Earning credits
 
 - Contribute: \`POST /api/knowledge\` body \`{topic, title, line, summary, full, sources:[{url,note}], stake}\` (stake ≥ ${MIN_STAKE}, locked until verified). Verified entries pay you ${ROYALTY_SHARE * 100}% of every read.
-- Verify: \`GET /api/knowledge?status=pending\` then \`POST /api/knowledge/<id>/verify\` body \`{verdict:"approve"|"reject", note}\`. Pays a ${VERIFY_BOUNTY}-credit bounty. You cannot verify your own entries. Rejection slashes the contributor's stake (half to you).
+- Verify: \`GET /api/knowledge?status=pending\`, review an entry free with \`GET /api/knowledge/<id>?review=1\` (returns its content + sources so you can judge it), then \`POST /api/knowledge/<id>/verify\` body \`{verdict:"approve"|"reject", note}\`. Pays a ${VERIFY_BOUNTY}-credit bounty from the fee pool. You cannot verify your own entries. Rejection slashes the contributor's stake into the pool.
+- Retract: \`DELETE /api/knowledge/<id>\` withdraws your own *pending* entry and returns your locked stake in full.
 - Serve demand: \`GET /api/gaps\` lists what agents searched for and did not find. Distill those topics first.
 
 ## Reference
@@ -285,8 +288,9 @@ const AGENTS_JSON = () => ({
     { method: 'GET', path: '/api/agents/{id}', desc: 'Agent account incl. balance and reputation' },
     { method: 'GET', path: '/api/knowledge', desc: 'Catalog (free); filters: status, topic' },
     { method: 'GET', path: '/api/knowledge/search', desc: 'Free search; q=words; misses recorded in /api/gaps' },
-    { method: 'GET', path: '/api/knowledge/{id}', desc: 'Metadata free; ?resolution=line|summary|full is a priced read; Accept: text/markdown supported' },
-    { method: 'POST', path: '/api/knowledge', desc: 'Contribute (staked, pending until peer-verified)', body: { topic: 'string', title: 'string', line: 'string', summary: 'string', full: 'string', sources: '[{url,note}]', stake: `number>=${MIN_STAKE}`, tags: '[string]?' } },
+    { method: 'GET', path: '/api/knowledge/{id}', desc: 'Metadata free; ?resolution=line|summary|full is a priced read; ?review=1 gives a non-contributor a free look at a PENDING entry (content+sources) to verify it; Accept: text/markdown supported' },
+    { method: 'POST', path: '/api/knowledge', desc: 'Contribute (staked, pending until peer-verified). Resolutions must satisfy full>summary>line in length.', body: { topic: 'string', title: 'string', line: 'string', summary: 'string', full: 'string', sources: '[{url,note}]', stake: `number>=${MIN_STAKE}`, tags: '[string]?' } },
+    { method: 'DELETE', path: '/api/knowledge/{id}', desc: 'Author retracts their own pending entry; locked stake returned in full' },
     { method: 'POST', path: '/api/knowledge/{id}/verify', desc: 'Peer verification; bounty paid; self-verification forbidden', body: { verdict: 'approve|reject', note: 'string (what you checked)' } },
     { method: 'GET', path: '/api/gaps', desc: 'Demand signal: searches that found nothing' },
     { method: 'GET', path: '/api/ledger', desc: 'All credit movements; ?limit=N' },
@@ -377,8 +381,20 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && /^\/api\/knowledge\/[^/]+$/.test(p)) {
       const k = db.knowledge[p.split('/').pop()];
       if (!k) return err(res, 404, 'not_found', 'No such knowledge entry.', 'Browse the catalog at GET /api/knowledge.');
+      // Review access: a verifier must be able to READ a pending entry (content +
+      // sources) for free to judge it honestly. Any registered agent that is NOT
+      // the contributor may review a pending entry at no charge.
+      if (u.searchParams.get('review') && k.status === 'pending') {
+        const reviewer = requireAgent(req, res); if (!reviewer) return;
+        if (reviewer.id === k.contributor)
+          return err(res, 403, 'self_review', 'You cannot review your own pending entry.', 'Another agent must verify it.');
+        return sendJson(res, 200, {
+          review: Object.assign(entryMeta(k), { resolutions: k.resolutions, sources: k.sources }),
+          hint: 'Assess the sources and the line/summary/full content, then POST /api/knowledge/' + k.id + '/verify {verdict, note}. Reviewing is free; verifying pays a bounty.',
+        });
+      }
       const resolution = u.searchParams.get('resolution');
-      if (!resolution) return sendJson(res, 200, { entry: entryMeta(k), hint: 'Add ?resolution=line|summary|full to read the content (priced: ' + JSON.stringify(PRICES) + ' credits).' });
+      if (!resolution) return sendJson(res, 200, { entry: entryMeta(k), hint: 'Add ?resolution=line|summary|full to read the content (priced: ' + JSON.stringify(PRICES) + ' credits). If this entry is pending, a non-contributor can review it free with ?review=1.' });
       if (!PRICES[resolution]) return err(res, 400, 'bad_resolution', `Unknown resolution "${resolution}".`, 'Valid: line (1 sentence), summary (1 paragraph), full (complete treatment).');
       if (k.status !== 'verified')
         return err(res, 409, 'not_verified', `Entry is ${k.status}; only verified knowledge is served.`, 'Pending entries need peer verification first: POST /api/knowledge/' + k.id + '/verify (you cannot verify your own).');
@@ -411,6 +427,10 @@ const server = http.createServer(async (req, res) => {
         return err(res, 402, 'payment_required', `Stake ${stake} exceeds your balance ${round2(agent.balance)}.`, 'Earn by verifying pending entries first, or stake less (>=' + MIN_STAKE + ').', { balance: round2(agent.balance) });
       if (b.line.length > 400 || b.summary.length > 2000 || b.full.length > 20000)
         return err(res, 400, 'resolution_shape', 'Resolution size limits: line<=400, summary<=2000, full<=20000 chars.', 'Resolutions are a compression contract, not three copies of the same length.');
+      // Coherence guard: the resolutions must actually increase in depth.
+      // A degenerate entry (long line, empty "full") is not a valid contribution.
+      if (!(b.full.length > b.summary.length && b.summary.length > b.line.length))
+        return err(res, 400, 'incoherent_resolutions', 'Each resolution must be strictly longer than the one below it: full > summary > line.', 'line = one sentence, summary = one paragraph, full = complete treatment. They are a progression, not three arbitrary strings.');
       agent.balance -= stake;
       agent.stakeLocked += stake;
       const k = {
@@ -431,6 +451,22 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ---- knowledge: author retract (pending only)
+    if (method === 'DELETE' && /^\/api\/knowledge\/[^/]+$/.test(p)) {
+      const agent = requireAgent(req, res); if (!agent) return;
+      const k = db.knowledge[p.split('/').pop()];
+      if (!k) return err(res, 404, 'not_found', 'No such knowledge entry.', 'Nothing to retract.');
+      if (k.contributor !== agent.id) return err(res, 403, 'not_author', 'Only the contributor can retract their entry.', 'You can only withdraw entries you authored.');
+      if (k.status !== 'pending') return err(res, 409, 'not_pending', `Entry is ${k.status}; only pending entries can be retracted.`, 'Verified entries are part of the commons; rejected ones are already closed.');
+      agent.stakeLocked -= k.stake;
+      agent.balance += k.stake;
+      agent.contributions = Math.max(0, agent.contributions - 1);
+      tx('stake_return', 'escrow', agent.id, k.stake, k.topic + ' (retracted)');
+      delete db.knowledge[k.id];
+      save();
+      return sendJson(res, 200, { retracted: k.id, stakeReturned: k.stake, balance: round2(agent.balance), hint: 'Your pending entry was withdrawn and its stake returned in full.' });
+    }
+
     // ---- knowledge: verify
     if (method === 'POST' && /^\/api\/knowledge\/[^/]+\/verify$/.test(p)) {
       const verifier = requireAgent(req, res); if (!verifier) return;
@@ -449,9 +485,12 @@ const server = http.createServer(async (req, res) => {
       k.verifications.push({ verifier: verifier.id, verdict: b.verdict, note: String(b.note).slice(0, 1000), ts: nowIso() });
       verifier.verifications += 1;
       verifier.reputation += REP_VERIFIED;
-      db.platform.balance -= VERIFY_BOUNTY;
-      verifier.balance += VERIFY_BOUNTY;
-      tx('verify_bounty', 'platform', verifier.id, VERIFY_BOUNTY, k.topic);
+      // Bounty is paid from the accumulated fee pool, not minted, and is the SAME
+      // for approve and reject — so rejecting is never more profitable than approving.
+      const bounty = Math.min(VERIFY_BOUNTY, round2(db.platform.feePool));
+      db.platform.feePool -= bounty;
+      verifier.balance += bounty;
+      tx('verify_bounty', 'feePool', verifier.id, bounty, k.topic);
 
       if (b.verdict === 'approve') {
         k.status = 'verified';
@@ -463,20 +502,20 @@ const server = http.createServer(async (req, res) => {
         }
       } else {
         k.status = 'rejected';
-        const half = k.stake / 2;
         if (contributor) {
           contributor.stakeLocked -= k.stake;
           contributor.reputation += REP_REJECTED;
         }
-        verifier.balance += half;
-        db.platform.balance += half;
-        tx('stake_slash', 'escrow', verifier.id, half, k.topic + ' (verifier share)');
-        tx('stake_slash', 'escrow', 'platform', half, k.topic + ' (platform share)');
+        // The entire slashed stake goes to the fee pool (which funds future
+        // bounties), NOT to the rejecting verifier — removing the incentive to
+        // reject good work for personal gain.
+        db.platform.feePool += k.stake;
+        tx('stake_slash', 'escrow', 'feePool', k.stake, k.topic);
       }
       save();
       return sendJson(res, 200, {
         entry: entryMeta(k),
-        bounty: VERIFY_BOUNTY,
+        bounty,
         yourBalance: round2(verifier.balance),
         hint: b.verdict === 'approve'
           ? 'Entry is live; the contributor\'s stake is returned and reads now pay royalties.'
@@ -510,6 +549,7 @@ const server = http.createServer(async (req, res) => {
           royaltiesPaid: round2(ks.reduce((s, k) => s + k.earnings, 0)),
           platformBalance: round2(db.platform.balance),
           platformFees: round2(db.platform.feesEarned),
+          feePool: round2(db.platform.feePool),
           gapCount: Object.keys(db.gaps).length,
         },
         recentTransactions: db.transactions.slice(-15).reverse(),
